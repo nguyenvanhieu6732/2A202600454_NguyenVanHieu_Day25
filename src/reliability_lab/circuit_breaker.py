@@ -5,6 +5,12 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, TypeVar
 
+try:
+    from prometheus_client import Gauge
+    CIRCUIT_STATE_GAUGE = Gauge('circuit_state', 'Circuit breaker state (0=CLOSED, 1=OPEN, 2=HALF_OPEN)', ['provider'])
+except ImportError:
+    CIRCUIT_STATE_GAUGE = None
+
 T = TypeVar("T")
 
 
@@ -66,20 +72,27 @@ class CircuitBreaker:
     def record_success(self) -> None:
         """Record success and close from HALF_OPEN if enough probes pass."""
         # TODO(student): refine success threshold handling and counters.
-        self.failure_count = 0
         self.success_count += 1
-        if self.state == CircuitState.HALF_OPEN and self.success_count >= self.success_threshold:
-            self._transition(CircuitState.CLOSED, "probe_success")
-            self.success_count = 0
+        if self.state == CircuitState.HALF_OPEN:
+            if self.success_count >= self.success_threshold:
+                self._transition(CircuitState.CLOSED, "probe_success")
+                self.failure_count = 0
+                self.success_count = 0
+        elif self.state == CircuitState.CLOSED:
+            self.failure_count = 0
 
     def record_failure(self) -> None:
         """Record failure and open when threshold is reached."""
         # TODO(student): handle HALF_OPEN failure explicitly and reset success counter.
-        self.failure_count += 1
         self.success_count = 0
-        if self.state == CircuitState.HALF_OPEN or self.failure_count >= self.failure_threshold:
-            self._transition(CircuitState.OPEN, "failure_threshold")
+        if self.state == CircuitState.HALF_OPEN:
+            self._transition(CircuitState.OPEN, "probe_failed")
             self.opened_at = time.monotonic()
+        elif self.state == CircuitState.CLOSED:
+            self.failure_count += 1
+            if self.failure_count >= self.failure_threshold:
+                self._transition(CircuitState.OPEN, "failure_threshold")
+                self.opened_at = time.monotonic()
 
     def _transition(self, new_state: CircuitState, reason: str) -> None:
         if self.state == new_state:
@@ -88,3 +101,6 @@ class CircuitBreaker:
             {"from": self.state.value, "to": new_state.value, "reason": reason, "ts": time.time()}
         )
         self.state = new_state
+        if CIRCUIT_STATE_GAUGE:
+            state_val = 0 if new_state == CircuitState.CLOSED else (1 if new_state == CircuitState.OPEN else 2)
+            CIRCUIT_STATE_GAUGE.labels(provider=self.name).set(state_val)

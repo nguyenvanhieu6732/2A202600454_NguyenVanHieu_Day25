@@ -71,18 +71,29 @@ def calculate_recovery_time_ms(gateway: ReliabilityGateway) -> float | None:
 
 def run_scenario(config: LabConfig, queries: list[str], scenario: ScenarioConfig) -> RunMetrics:
     """Run a single named chaos scenario."""
+    import concurrent.futures
     gateway = build_gateway(config, scenario.provider_overrides or None)
     metrics = RunMetrics()
     request_count = config.load_test.requests
-    for _ in range(request_count):
+    concurrency = getattr(config.load_test, "concurrency", 1)
+    
+    def process_request(_: int):
         prompt = random.choice(queries)
-        result = gateway.complete(prompt)
+        return gateway.complete(prompt)
+        
+    if concurrency > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
+            results = list(executor.map(process_request, range(request_count)))
+    else:
+        results = [process_request(i) for i in range(request_count)]
+        
+    for result in results:
         metrics.total_requests += 1
         metrics.estimated_cost += result.estimated_cost
         if result.cache_hit:
             metrics.cache_hits += 1
             metrics.estimated_cost_saved += 0.001
-        if result.route == "fallback":
+        if result.route.startswith("fallback"):
             metrics.fallback_successes += 1
             metrics.successful_requests += 1
         elif result.route == "static_fallback":
@@ -118,7 +129,15 @@ def run_simulation(config: LabConfig, queries: list[str]) -> RunMetrics:
 
         # TODO(student): Define pass/fail criteria per scenario.
         # Example: primary_timeout_100 passes if fallback_success_rate > 0.9
-        passed = result.successful_requests > 0
+        if scenario.name == "primary_timeout_100":
+            passed = result.fallback_success_rate > 0.9 and result.error_rate < 0.1
+        elif scenario.name == "primary_flaky_50":
+            passed = result.circuit_open_count > 0 and result.successful_requests > 0
+        elif scenario.name == "cache_stale_candidate":
+            passed = result.successful_requests > 0
+        else:
+            passed = result.successful_requests > 0
+
         combined.scenarios[scenario.name] = "pass" if passed else "fail"
 
         combined.total_requests += result.total_requests
